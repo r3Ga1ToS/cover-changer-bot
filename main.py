@@ -1,114 +1,132 @@
+import logging
 import os
-import asyncio
-import threading
-from flask import Flask
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, FSInputFile
-from aiogram.filters import CommandStart
-from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
+import re
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
+from config import BOT_TOKEN
 
-from config import API_TOKEN
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
-# Initialize bot and dispatcher with HTML parse mode for bold text
-bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
+# In-memory store: user_id -> file_id of saved thumbnail
+user_thumbnails: dict[int, str] = {}
 
-# Temporary in-memory storage for user thumbnails {user_id: photo_file_id}
-user_thumbnails = {}
 
-# Flask health check server
-app = Flask(__name__)
+def bold_caption(text: str) -> str:
+    """Strip any existing markdown formatting and return plain bold text."""
+    if not text:
+        return text
+    # Remove existing markdown: bold (**), italic (*/_), mono (`)
+    cleaned = re.sub(r"[*_`]", "", text)
+    return f"**{cleaned.strip()}**"
 
-@app.route("/")
-def home():
-    return "Bot is running."
 
-def run_flask():
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+# ── /start ──────────────────────────────────────────────────────────────────
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "✅ Bot is online!\n\n"
+        "Send me a *photo* first and I'll save it as your thumbnail.\n"
+        "Then send a *video file* and I'll attach the thumbnail to it.",
+        parse_mode="Markdown",
+    )
 
-@dp.message(CommandStart())
-async def start_cmd(message: Message):
-    await message.reply("Jinda hun. Photo bej cover laga dunga.")
 
-@dp.message(F.photo)
-async def auto_save_thumbnail(message: Message):
-    # Automatically grab the highest quality photo sent and save its file_id
-    user_thumbnails[message.from_user.id] = message.photo[-1].file_id
-    await message.reply("Cover saved! Now send the file.")
+# ── Photo handler ────────────────────────────────────────────────────────────
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    # Pick the highest-resolution version
+    photo = update.message.photo[-1]
+    user_thumbnails[user_id] = photo.file_id
+    await update.message.reply_text("✅ New Thumbnail Saved.\nNow send the video file.")
 
-@dp.message(F.document | F.video)
-async def process_file(message: Message):
-    user_id = message.from_user.id
-    
-    # Check if user has sent a photo first
+
+# ── Document (video file) handler ────────────────────────────────────────────
+async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    message = update.message
+    doc = message.document
+
+    # Only handle video-like documents
+    video_mime_prefixes = ("video/",)
+    video_extensions = (".mkv", ".mp4", ".avi", ".mov", ".ts", ".m2ts", ".webm", ".flv")
+
+    is_video_doc = False
+    if doc.mime_type and any(doc.mime_type.startswith(p) for p in video_mime_prefixes):
+        is_video_doc = True
+    elif doc.file_name and any(doc.file_name.lower().endswith(ext) for ext in video_extensions):
+        is_video_doc = True
+
+    if not is_video_doc:
+        return  # Ignore non-video documents silently
+
     if user_id not in user_thumbnails:
-        await message.reply("Please send a photo first so I can use it as a cover.")
+        await message.reply_text(
+            "⚠️ No thumbnail saved yet.\nPlease send a *photo* first.",
+            parse_mode="Markdown",
+        )
         return
 
-    status_msg = await message.reply("Processing... please wait.")
+    thumbnail_file_id = user_thumbnails[user_id]
 
-    try:
-        # 1. Format the caption to bold if it exists
-        caption = message.caption or ""
-        bold_caption = f"<b>{caption}</b>" if caption else ""
+    # Build bold caption (use filename if no caption provided)
+    raw_caption = message.caption or doc.file_name or ""
+    caption = bold_caption(raw_caption)
 
-        # 2. Download the cover photo
-        thumb_file_id = user_thumbnails[user_id]
-        thumb_info = await bot.get_file(thumb_file_id)
-        thumb_path = f"thumb_{user_id}.jpg"
-        await bot.download_file(thumb_info.file_path, thumb_path)
+    await message.reply_document(
+        document=doc.file_id,
+        thumbnail=thumbnail_file_id,
+        caption=caption,
+        parse_mode="Markdown",
+    )
 
-        # 3. Download the main document/video
-        file_obj = message.video if message.video else message.document
-        file_info = await bot.get_file(file_obj.file_id)
-        file_name = getattr(file_obj, 'file_name', f"file_{user_id}.mp4")
-        file_path = f"dl_{file_name}"
-        
-        await bot.download_file(file_info.file_path, file_path)
-        await status_msg.edit_text("Uploading with new cover...")
 
-        # 4. Upload back to Telegram
-        main_input = FSInputFile(file_path)
-        thumb_input = FSInputFile(thumb_path)
+# ── Video handler (for .mp4 sent as video, not document) ────────────────────
+async def video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    message = update.message
+    video = message.video
 
-        if message.video:
-            await message.reply_video(
-                video=main_input,
-                caption=bold_caption,
-                thumbnail=thumb_input,
-                supports_streaming=True
-            )
-        else:
-            await message.reply_document(
-                document=main_input,
-                caption=bold_caption,
-                thumbnail=thumb_input
-            )
+    if user_id not in user_thumbnails:
+        await message.reply_text(
+            "⚠️ No thumbnail saved yet.\nPlease send a *photo* first.",
+            parse_mode="Markdown",
+        )
+        return
 
-        # 5. Cleanup local files to save space
-        os.remove(file_path)
-        os.remove(thumb_path)
-        await status_msg.delete()
+    thumbnail_file_id = user_thumbnails[user_id]
+    raw_caption = message.caption or video.file_name or ""
+    caption = bold_caption(raw_caption)
 
-    except Exception as e:
-        await status_msg.edit_text(f"An error occurred: {e}")
+    await message.reply_video(
+        video=video.file_id,
+        thumbnail=thumbnail_file_id,
+        caption=caption,
+        parse_mode="Markdown",
+        supports_streaming=True,
+    )
 
-async def main():
-    print("🚀 Bot is starting...")
-    await dp.start_polling(bot)
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+def main() -> None:
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    app.add_handler(MessageHandler(filters.VIDEO, video_handler))
+    app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
+
+    logger.info("Bot started — polling...")
+    app.run_polling()
+
 
 if __name__ == "__main__":
-    print(r'''
-    ____  ____  ________
-   / __ )/ __ \/_  __/ /
-  / __  / / / / / / / / 
- / /_/ / /_/ / / / /_/  
-/_____/\____/ /_/ (_)   
-                        
-  BOT WORKING PROPERLY....
-    ''')
-    print("Starting Bot...")
-    threading.Thread(target=run_flask, daemon=True).start()
-    asyncio.run(main())
+    main()
